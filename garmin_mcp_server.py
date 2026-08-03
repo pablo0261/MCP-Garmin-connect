@@ -183,7 +183,9 @@ def build_remote_app():
     class AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
             auth = request.headers.get("authorization", "")
-            if auth != f"Bearer {secret}":
+            token_from_header = auth.replace("Bearer ", "", 1) if auth.startswith("Bearer ") else None
+            token_from_query = request.query_params.get("token")
+            if secret not in (token_from_header, token_from_query):
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await call_next(request)
 
