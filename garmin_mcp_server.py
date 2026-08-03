@@ -173,8 +173,17 @@ def build_remote_app():
     La única barrera de seguridad, por ahora, es que la URL de Render no es
     pública ni fácil de adivinar. No compartas esta URL. Si en algún momento
     querés subir el nivel de seguridad, la vía es implementar OAuth (fase 3).
+
+    stateless_http=True: Render (plan free) apaga el proceso tras períodos
+    de inactividad y lo reinicia en frío en el próximo request. El modo
+    stateful de MCP guarda el session_id en memoria del proceso, así que
+    cualquier reinicio de Render invalida la sesión y el cliente (Claude)
+    recibe "Bad Request: Missing session ID". stateless_http evita esto:
+    cada request se procesa de forma independiente, sin depender de una
+    sesión previa en memoria. Es la opción correcta para este caso de uso
+    (un solo usuario, hosting con cold starts).
     """
-    inner_app = mcp.streamable_http_app(host="0.0.0.0")
+    inner_app = mcp.streamable_http_app(host="0.0.0.0", stateless_http=True)
     return inner_app
 
 
