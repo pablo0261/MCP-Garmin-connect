@@ -163,34 +163,18 @@ def do_login():
 def build_remote_app():
     """App ASGI para despliegue remoto (Railway/Fly.io/VPS propia).
 
-    Protegida por un token compartido simple: todo request tiene que traer
-    el header `Authorization: Bearer <MCP_SHARED_SECRET>`. No es OAuth, es
-    un candado básico para que el servidor no quede abierto a cualquiera en
-    internet — suficiente para uso personal, no para exponerlo a terceros.
+    SIN autenticación propia: el flujo "Vincular" de conectores custom de
+    claude.ai intenta registrar un cliente OAuth automáticamente contra el
+    servidor, y no ofrece una forma simple de mandar un token estático en el
+    header. Implementar OAuth completo (registro dinámico de cliente,
+    authorization endpoint, token endpoint) es un desarrollo bastante más
+    grande, fuera de alcance para este uso personal.
+
+    La única barrera de seguridad, por ahora, es que la URL de Render no es
+    pública ni fácil de adivinar. No compartas esta URL. Si en algún momento
+    querés subir el nivel de seguridad, la vía es implementar OAuth (fase 3).
     """
-    from starlette.applications import Starlette
-    from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import JSONResponse
-
-    secret = os.getenv("MCP_SHARED_SECRET")
-    if not secret:
-        raise RuntimeError(
-            "Falta la variable de entorno MCP_SHARED_SECRET. "
-            "Definila antes de desplegar (es tu contraseña de acceso al servidor)."
-        )
-
-    class AuthMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            auth = request.headers.get("authorization", "")
-            token_from_header = auth.replace("Bearer ", "", 1) if auth.startswith("Bearer ") else None
-            token_from_query = request.query_params.get("token")
-            if secret not in (token_from_header, token_from_query):
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-            return await call_next(request)
-
     inner_app = mcp.streamable_http_app(host="0.0.0.0")
-    inner_app.add_middleware(AuthMiddleware)
     return inner_app
 
 
