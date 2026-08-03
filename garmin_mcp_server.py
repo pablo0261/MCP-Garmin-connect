@@ -28,7 +28,12 @@ import sys
 from datetime import date, datetime
 from typing import Optional
 
-from garminconnect import Garmin, GarminConnectAuthenticationError
+from garminconnect import Garmin
+from garminconnect.exceptions import (
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 from mcp.server import MCPServer
 
 TOKEN_DIR = os.path.expanduser("~/.garminconnect")
@@ -39,7 +44,19 @@ _client: Optional[Garmin] = None
 
 
 def get_client() -> Garmin:
-    """Devuelve un cliente Garmin autenticado, reusando la sesión cacheada."""
+    """Devuelve un cliente Garmin autenticado.
+
+    Estrategia en dos pasos:
+    1. Intenta reusar el token guardado (GARMIN_TOKENS o el cacheado en disco).
+       Es lo más rápido y no golpea el login de Garmin en cada arranque.
+    2. Si el token no existe o expiró, hace login directo con email/password
+       (variables de entorno GARMIN_EMAIL / GARMIN_PASSWORD) — pensado para
+       una cuenta SIN verificación en dos pasos (MFA), ya que este flujo no
+       tiene forma de pedir un código interactivamente en un servidor.
+
+    Esto evita tener que exportar el token a mano cada vez que expira: en el
+    peor caso, el próximo arranque re-loguea solo con las credenciales.
+    """
     global _client
     if _client is not None:
         return _client
@@ -52,10 +69,44 @@ def get_client() -> Garmin:
         client.login(tokenstore)  # intenta reusar tokens guardados
         _client = client
         return _client
-    except (FileNotFoundError, GarminConnectAuthenticationError):
+    except (
+        FileNotFoundError,
+        GarminConnectAuthenticationError,
+        GarminConnectConnectionError,
+    ):
+        pass  # el token no existe o expiró, probamos login directo abajo
+
+    email = os.getenv("GARMIN_EMAIL")
+    password = os.getenv("GARMIN_PASSWORD")
+    if not email or not password:
         raise RuntimeError(
-            "No hay sesión guardada o expiró. Corré primero:\n"
-            "    python3 garmin_mcp_server.py --login"
+            "No hay sesión guardada ni credenciales configuradas.\n"
+            "Corré 'python3 garmin_mcp_server.py --login' localmente, o "
+            "seteá GARMIN_EMAIL y GARMIN_PASSWORD como variables de entorno "
+            "en Render para login automático."
+        )
+
+    try:
+        client = Garmin(email=email, password=password)
+        client.login()
+        _client = client
+        return _client
+    except GarminConnectAuthenticationError as e:
+        raise RuntimeError(
+            f"Login automático con GARMIN_EMAIL/GARMIN_PASSWORD falló: {e}\n"
+            "Verificá que el email y password sean correctos y que la cuenta "
+            "no tenga verificación en dos pasos (MFA) activada."
+        )
+    except GarminConnectTooManyRequestsError as e:
+        raise RuntimeError(
+            f"Garmin bloqueó temporalmente los intentos de login (rate limit): {e}\n"
+            "Esperá unos minutos antes de reintentar."
+        )
+    except GarminConnectConnectionError as e:
+        raise RuntimeError(
+            f"No se pudo conectar a Garmin para hacer login: {e}\n"
+            "Puede ser un bloqueo temporal (Cloudflare) o un problema de red "
+            "del lado de Garmin. Reintentá en unos minutos."
         )
 
 
