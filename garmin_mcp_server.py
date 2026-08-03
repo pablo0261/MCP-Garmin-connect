@@ -1,0 +1,221 @@
+"""
+Servidor MCP propio para Garmin Connect.
+
+Expone como "tools" MCP las consultas de datos deportivos que veníamos usando
+vía FitMCP: actividades, laps/splits, y estadísticas diarias (sueño, HR en
+reposo, body battery, estrés). Pensado para conectarlo a Claude Desktop /
+Claude Code, no a claude.ai web (que solo admite MCP remotos por URL, no
+servidores locales por stdio).
+
+Requisitos:
+    pip install garminconnect mcp
+
+Autenticación:
+    La primera vez, correlo una vez a mano para generar la sesión cacheada:
+
+        python3 garmin_mcp_server.py --login
+
+    Te va a pedir email y password de Garmin Connect (y el código de MFA si
+    lo tenés activado) UNA sola vez. Guarda los tokens de sesión en
+    ~/.garminconnect/ y los reutiliza en las corridas siguientes sin volver
+    a pedir credenciales, igual que hace la app oficial.
+"""
+
+import argparse
+import getpass
+import os
+import sys
+from datetime import date, datetime
+from typing import Optional
+
+from garminconnect import Garmin, GarminConnectAuthenticationError
+from mcp.server import MCPServer
+
+TOKEN_DIR = os.path.expanduser("~/.garminconnect")
+
+mcp = MCPServer("garmin-mcp")
+
+_client: Optional[Garmin] = None
+
+
+def get_client() -> Garmin:
+    """Devuelve un cliente Garmin autenticado, reusando la sesión cacheada."""
+    global _client
+    if _client is not None:
+        return _client
+
+    # En deploy remoto (sin filesystem persistente) los tokens viajan como
+    # variable de entorno; en local se leen del path cacheado en disco.
+    tokenstore = os.getenv("GARMIN_TOKENS") or TOKEN_DIR
+    try:
+        client = Garmin()
+        client.login(tokenstore)  # intenta reusar tokens guardados
+        _client = client
+        return _client
+    except (FileNotFoundError, GarminConnectAuthenticationError):
+        raise RuntimeError(
+            "No hay sesión guardada o expiró. Corré primero:\n"
+            "    python3 garmin_mcp_server.py --login"
+        )
+
+
+@mcp.tool()
+def get_activities(fecha_inicio: str, fecha_fin: str) -> list[dict]:
+    """Actividades de Garmin (running, ciclismo, etc.) en un rango de fechas.
+
+    Args:
+        fecha_inicio: YYYY-MM-DD
+        fecha_fin: YYYY-MM-DD
+    """
+    client = get_client()
+    activities = client.get_activities_by_date(fecha_inicio, fecha_fin)
+    out = []
+    for a in activities:
+        out.append({
+            "id": a.get("activityId"),
+            "nombre": a.get("activityName"),
+            "tipo": a.get("activityType", {}).get("typeKey"),
+            "fecha": a.get("startTimeLocal"),
+            "distancia_km": round((a.get("distance") or 0) / 1000, 2),
+            "duracion_minutos": round((a.get("duration") or 0) / 60, 1),
+            "fc_media": a.get("averageHR"),
+            "fc_maxima": a.get("maxHR"),
+            "calorias": a.get("calories"),
+            "cadencia_media_ppm": a.get("averageRunningCadenceInStepsPerMinute"),
+            "ritmo_medio_min_km": _pace(a.get("averageSpeed")),
+            "vo2max": a.get("vO2MaxValue"),
+        })
+    return out
+
+
+@mcp.tool()
+def get_activity_laps(activity_id: int) -> list[dict]:
+    """Parciales/laps de una actividad puntual: ritmo y FC de cada tramo.
+
+    Args:
+        activity_id: ID de la actividad (viene de get_activities)
+    """
+    client = get_client()
+    splits = client.get_activity_splits(activity_id)
+    out = []
+    for i, lap in enumerate(splits.get("lapDTOs", []), start=1):
+        out.append({
+            "lap": i,
+            "distancia_km": round((lap.get("distance") or 0) / 1000, 2),
+            "duracion_min": round((lap.get("duration") or 0) / 60, 2),
+            "ritmo_min_km": _pace(lap.get("averageSpeed")),
+            "fc_media": lap.get("averageHR"),
+            "fc_max": lap.get("maxHR"),
+            "cadencia_media": lap.get("averageRunCadence"),
+        })
+    return out
+
+
+@mcp.tool()
+def get_daily_stats(fecha: str) -> dict:
+    """Estadísticas diarias: pasos, FC reposo, estrés, body battery.
+
+    Args:
+        fecha: YYYY-MM-DD
+    """
+    client = get_client()
+    return client.get_stats(fecha)
+
+
+@mcp.tool()
+def get_sleep(fecha: str) -> dict:
+    """Desglose de sueño de una noche puntual.
+
+    Args:
+        fecha: YYYY-MM-DD (fecha de la mañana en que te despertaste)
+    """
+    client = get_client()
+    return client.get_sleep_data(fecha)
+
+
+def _pace(speed_m_s: Optional[float]) -> Optional[str]:
+    if not speed_m_s:
+        return None
+    min_per_km = 1000 / speed_m_s / 60
+    minutes = int(min_per_km)
+    seconds = round((min_per_km - minutes) * 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+def _ask_mfa_code() -> str:
+    return input("Código MFA (si tenés verificación en 2 pasos activada en Garmin): ").strip()
+
+
+def do_login():
+    print("=== Login a Garmin Connect (solo se hace una vez) ===")
+    email = input("Email: ").strip()
+    password = getpass.getpass("Password: ")
+    os.makedirs(TOKEN_DIR, exist_ok=True)
+    client = Garmin(email, password, prompt_mfa=_ask_mfa_code)
+    try:
+        client.login(TOKEN_DIR)  # autentica y persiste los tokens en TOKEN_DIR
+    except Exception as e:
+        print(f"Error de login: {e}")
+        sys.exit(1)
+    print(f"Sesión guardada en {TOKEN_DIR}. Ya podés correr el servidor MCP normalmente.")
+
+
+def build_remote_app():
+    """App ASGI para despliegue remoto (Railway/Fly.io/VPS propia).
+
+    Protegida por un token compartido simple: todo request tiene que traer
+    el header `Authorization: Bearer <MCP_SHARED_SECRET>`. No es OAuth, es
+    un candado básico para que el servidor no quede abierto a cualquiera en
+    internet — suficiente para uso personal, no para exponerlo a terceros.
+    """
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    secret = os.getenv("MCP_SHARED_SECRET")
+    if not secret:
+        raise RuntimeError(
+            "Falta la variable de entorno MCP_SHARED_SECRET. "
+            "Definila antes de desplegar (es tu contraseña de acceso al servidor)."
+        )
+
+    class AuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            auth = request.headers.get("authorization", "")
+            if auth != f"Bearer {secret}":
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            return await call_next(request)
+
+    inner_app = mcp.streamable_http_app(host="0.0.0.0")
+    inner_app.add_middleware(AuthMiddleware)
+    return inner_app
+
+
+def do_export_token():
+    """Imprime los tokens locales como un string JSON de una sola línea,
+    listo para pegar en la variable de entorno GARMIN_TOKENS del hosting
+    remoto (Railway/Fly.io). Requiere haber corrido --login antes."""
+    client = Garmin()
+    client.login(TOKEN_DIR)
+    print(client.client.dumps())
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--login", action="store_true", help="Hacer login inicial y guardar sesión")
+    parser.add_argument("--export-token", action="store_true", help="Exportar la sesión local como string para GARMIN_TOKENS")
+    parser.add_argument("--remote", action="store_true", help="Correr como servidor remoto (streamable-http) en vez de stdio local")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
+    args = parser.parse_args()
+
+    if args.login:
+        do_login()
+    elif args.export_token:
+        do_export_token()
+    elif args.remote:
+        import uvicorn
+        app = build_remote_app()
+        uvicorn.run(app, host="0.0.0.0", port=args.port)
+    else:
+        mcp.run(transport="stdio")
