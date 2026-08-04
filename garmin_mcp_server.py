@@ -34,6 +34,16 @@ from garminconnect.exceptions import (
     GarminConnectConnectionError,
     GarminConnectTooManyRequestsError,
 )
+from garminconnect.workout import (
+    ConditionType,
+    ExecutableStep,
+    RepeatGroup,
+    RunningWorkout,
+    SportType,
+    StepType,
+    TargetType,
+    WorkoutSegment,
+)
 from mcp.server import MCPServer
 
 TOKEN_DIR = os.path.expanduser("~/.garminconnect")
@@ -182,6 +192,359 @@ def get_sleep(fecha: str) -> dict:
     """
     client = get_client()
     return client.get_sleep_data(fecha)
+
+
+# ---------------------------------------------------------------------------
+# Tools de escritura: creación y gestión de entrenamientos estructurados.
+#
+# Usa el módulo garminconnect.workout, que expone modelos tipados sobre el
+# endpoint interno (no documentado oficialmente) workout-service de Garmin
+# Connect. El formato de "steps" que reciben estas tools está pensado para
+# ser el mismo que ya usábamos con FitMCP, para no tener que aprender una
+# sintaxis nueva.
+# ---------------------------------------------------------------------------
+
+_STEP_TYPE_MAP = {
+    "warmup": (StepType.WARMUP, "warmup", 1),
+    "cooldown": (StepType.COOLDOWN, "cooldown", 2),
+    "interval": (StepType.INTERVAL, "interval", 3),
+    "recovery": (StepType.RECOVERY, "recovery", 4),
+    "rest": (StepType.REST, "rest", 5),
+}
+
+
+def _pace_to_mps(pace_str: str) -> float:
+    """Convierte un ritmo 'mm:ss' (minutos por km) a metros/segundo.
+
+    Garmin guarda internamente los targets de ritmo como velocidad, no como
+    ritmo — este es el punto donde más fácil es meter un error de signo.
+    """
+    minutes_str, seconds_str = pace_str.split(":")
+    total_seconds_per_km = int(minutes_str) * 60 + int(seconds_str)
+    return round(1000.0 / total_seconds_per_km, 4)
+
+
+def _build_target(target: Optional[dict]) -> dict:
+    """Traduce {'type': 'pace'|'heart_rate', 'min': .., 'max': ..} al par de
+    campos (targetType + targetValueOne/Two) que espera Garmin.
+
+    Para 'pace': 'min' es el ritmo MÁS LENTO (ej. '5:10') y 'max' el MÁS
+    RÁPIDO (ej. '5:00'). Como Garmin lo guarda como velocidad (m/s), quedan
+    invertidos: ritmo lento -> velocidad baja -> targetValueOne; ritmo
+    rápido -> velocidad alta -> targetValueTwo.
+
+    Para 'heart_rate': 'min'/'max' van directo en bpm, sin conversión.
+    """
+    if not target:
+        return {
+            "targetType": {
+                "workoutTargetTypeId": TargetType.NO_TARGET,
+                "workoutTargetTypeKey": "no.target",
+                "displayOrder": 1,
+            }
+        }
+
+    ttype = target.get("type")
+    if ttype == "pace":
+        slow_pace = target.get("min")
+        fast_pace = target.get("max")
+        return {
+            "targetType": {
+                "workoutTargetTypeId": TargetType.PACE_ZONE,
+                "workoutTargetTypeKey": "pace.zone",
+                "displayOrder": 6,
+            },
+            "targetValueOne": _pace_to_mps(slow_pace) if slow_pace else None,
+            "targetValueTwo": _pace_to_mps(fast_pace) if fast_pace else None,
+        }
+    elif ttype == "heart_rate":
+        return {
+            "targetType": {
+                "workoutTargetTypeId": TargetType.HEART_RATE_ZONE,
+                "workoutTargetTypeKey": "heart.rate.zone",
+                "displayOrder": 4,
+            },
+            "targetValueOne": target.get("min"),
+            "targetValueTwo": target.get("max"),
+        }
+    else:
+        raise ValueError(
+            f"Tipo de target no soportado: {ttype!r} (usar 'pace' o 'heart_rate')"
+        )
+
+
+def _estimate_step_seconds(step: dict) -> float:
+    """Estima la duración de un paso para el campo informativo
+    estimatedDurationInSecs. No afecta el entrenamiento real (que corre por
+    duración o distancia real), solo lo que Garmin muestra como estimado."""
+    if step.get("type") == "repeat":
+        one_iter = sum(_estimate_step_seconds(s) for s in step["steps"])
+        return one_iter * step["reps"]
+
+    if "duration_seconds" in step:
+        return float(step["duration_seconds"])
+
+    if "distance_meters" in step:
+        target = step.get("target")
+        pace_mps = None
+        if target and target.get("type") == "pace":
+            paces = [p for p in (target.get("min"), target.get("max")) if p]
+            if paces:
+                pace_mps = sum(_pace_to_mps(p) for p in paces) / len(paces)
+        if not pace_mps:
+            pace_mps = 1000.0 / 360  # default conservador: 6:00/km
+        return step["distance_meters"] / pace_mps
+
+    return 0.0
+
+
+class _OrderCounter:
+    """Contador simple para stepOrder, que Garmin exige incremental dentro
+    de todo el workout (incluyendo los pasos anidados en repeticiones)."""
+
+    def __init__(self):
+        self.n = 0
+
+    def next(self) -> int:
+        self.n += 1
+        return self.n
+
+
+def _build_executable_step(step: dict, counter: _OrderCounter) -> ExecutableStep:
+    step_type_key = step["type"]
+    if step_type_key not in _STEP_TYPE_MAP:
+        raise ValueError(
+            f"Tipo de paso no soportado: {step_type_key!r} "
+            "(usar 'warmup', 'interval', 'recovery', 'cooldown', 'rest' o 'repeat')"
+        )
+    step_type_id, step_type_str, display_order = _STEP_TYPE_MAP[step_type_key]
+
+    if "duration_seconds" in step:
+        end_condition = {
+            "conditionTypeId": ConditionType.TIME,
+            "conditionTypeKey": "time",
+            "displayOrder": 2,
+            "displayable": True,
+        }
+        end_value = float(step["duration_seconds"])
+    elif "distance_meters" in step:
+        end_condition = {
+            "conditionTypeId": ConditionType.DISTANCE,
+            "conditionTypeKey": "distance",
+            "displayOrder": 3,
+            "displayable": True,
+        }
+        end_value = float(step["distance_meters"])
+    else:
+        raise ValueError(
+            f"El paso {step!r} necesita 'duration_seconds' o 'distance_meters'"
+        )
+
+    target_fields = _build_target(step.get("target"))
+
+    return ExecutableStep(
+        stepOrder=counter.next(),
+        stepType={
+            "stepTypeId": step_type_id,
+            "stepTypeKey": step_type_str,
+            "displayOrder": display_order,
+        },
+        endCondition=end_condition,
+        endConditionValue=end_value,
+        **target_fields,
+    )
+
+
+def _build_steps(steps: list[dict], counter: _OrderCounter) -> list:
+    result = []
+    for step in steps:
+        if step.get("type") == "repeat":
+            reps = step["reps"]
+            nested = _build_steps(step["steps"], counter)
+            result.append(
+                RepeatGroup(
+                    stepOrder=counter.next(),
+                    stepType={
+                        "stepTypeId": StepType.REPEAT,
+                        "stepTypeKey": "repeat",
+                        "displayOrder": 6,
+                    },
+                    numberOfIterations=reps,
+                    workoutSteps=nested,
+                    endCondition={
+                        "conditionTypeId": ConditionType.ITERATIONS,
+                        "conditionTypeKey": "iterations",
+                        "displayOrder": 7,
+                        "displayable": True,
+                    },
+                    endConditionValue=float(reps),
+                )
+            )
+        else:
+            result.append(_build_executable_step(step, counter))
+    return result
+
+
+def _build_running_workout(title: str, steps: list[dict], description: Optional[str]) -> RunningWorkout:
+    """Construye el objeto RunningWorkout a partir del formato de steps
+    compartido por create_workout y update_workout."""
+    counter = _OrderCounter()
+    built_steps = _build_steps(steps, counter)
+    total_duration = sum(_estimate_step_seconds(s) for s in steps)
+
+    return RunningWorkout(
+        workoutName=title,
+        description=description,
+        estimatedDurationInSecs=int(total_duration),
+        workoutSegments=[
+            WorkoutSegment(
+                segmentOrder=1,
+                sportType={
+                    "sportTypeId": SportType.RUNNING,
+                    "sportTypeKey": "running",
+                    "displayOrder": 1,
+                },
+                workoutSteps=built_steps,
+            )
+        ],
+    )
+
+
+@mcp.tool()
+def create_workout(
+    title: str,
+    steps: list[dict],
+    date_str: Optional[str] = None,
+    description: Optional[str] = None,
+) -> dict:
+    """Crea un entrenamiento de running estructurado en Garmin Connect y,
+    si se indica date_str, lo programa en el calendario para que se
+    sincronice automáticamente al reloj.
+
+    Args:
+        title: Nombre del entrenamiento.
+        steps: Lista de pasos. Cada paso es un dict con:
+            - type: 'warmup' | 'interval' | 'recovery' | 'cooldown' | 'rest' | 'repeat'
+            - duration_seconds O distance_meters (no aplica si type='repeat')
+            - target (opcional): {'type': 'pace'|'heart_rate', 'min': X, 'max': Y}
+              Para 'pace', min/max van en formato 'mm:ss' (minutos por km),
+              donde 'min' es el ritmo MÁS LENTO y 'max' el MÁS RÁPIDO.
+              Para 'heart_rate', min/max van directo en bpm.
+            - Para repeticiones: {'type': 'repeat', 'reps': N, 'steps': [...]}
+        date_str: Fecha YYYY-MM-DD para programarlo en el calendario Garmin.
+            Si se omite, el entreno queda solo en la biblioteca de workouts.
+        description: Descripción del entrenamiento (opcional).
+    """
+    client = get_client()
+    workout = _build_running_workout(title, steps, description)
+
+    result = client.upload_running_workout(workout)
+    workout_id = result.get("workoutId")
+
+    scheduled = False
+    if date_str and workout_id:
+        client.schedule_workout(workout_id, date_str)
+        scheduled = True
+
+    return {
+        "workout_id": workout_id,
+        "titulo": title,
+        "programado_para": date_str if scheduled else None,
+    }
+
+
+@mcp.tool()
+def update_workout(
+    workout_id: str,
+    title: str,
+    steps: list[dict],
+    date_str: Optional[str] = None,
+    description: Optional[str] = None,
+) -> dict:
+    """Modifica EN SITIO un entrenamiento que ya existe en Garmin Connect
+    (mantiene el mismo workout_id, así que cualquier programación en el
+    calendario que ya apuntaba a él sigue siendo válida — no crea un
+    duplicado). Usar para corregir un entreno ya subido en vez de crear
+    otro y borrar el viejo.
+
+    Hay que mandar el entreno CORREGIDO COMPLETO (reemplaza todo el
+    contenido, no solo la parte que cambia) — Garmin actualiza por PUT.
+
+    Args:
+        workout_id: ID del entreno a modificar (sale de create_workout o
+            get_planned_workouts).
+        title: Nombre del entrenamiento (corregido).
+        steps: Lista de pasos completa, mismo formato que create_workout.
+        date_str: Si se indica, además MUEVE el entreno a esa fecha en el
+            calendario. Si se omite, el entreno se queda en su fecha actual.
+        description: Descripción del entrenamiento (opcional).
+    """
+    client = get_client()
+    workout = _build_running_workout(title, steps, description)
+    workout_dict = workout.to_dict()
+
+    client.update_workout(workout_id, workout_dict)
+
+    moved = False
+    if date_str:
+        client.schedule_workout(workout_id, date_str)
+        moved = True
+
+    return {
+        "workout_id": workout_id,
+        "titulo": title,
+        "actualizado": True,
+        "movido_a": date_str if moved else None,
+    }
+
+
+@mcp.tool()
+def get_planned_workouts(fecha_inicio: str, fecha_fin: str) -> list[dict]:
+    """Entrenamientos programados en el calendario de Garmin Connect en un
+    rango de fechas.
+
+    Args:
+        fecha_inicio: YYYY-MM-DD
+        fecha_fin: YYYY-MM-DD
+    """
+    client = get_client()
+    start = datetime.strptime(fecha_inicio, "%Y-%m-%d").date()
+    end = datetime.strptime(fecha_fin, "%Y-%m-%d").date()
+
+    out = []
+    seen_months = set()
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month):
+        if (year, month) not in seen_months:
+            seen_months.add((year, month))
+            data = client.get_scheduled_workouts(year, month)
+            for w in data.get("workoutsScheduled", data.get("workouts", []) if isinstance(data, dict) else []):
+                w_date = w.get("date") or w.get("calendarDate")
+                if w_date and start.isoformat() <= w_date <= end.isoformat():
+                    out.append({
+                        "scheduled_id": w.get("id") or w.get("scheduledWorkoutId"),
+                        "workout_id": w.get("workoutId"),
+                        "titulo": w.get("title") or w.get("workoutName"),
+                        "fecha": w_date,
+                    })
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return out
+
+
+@mcp.tool()
+def delete_workout(workout_id: str) -> dict:
+    """Borra un entrenamiento de la biblioteca de Garmin Connect (y todas
+    sus fechas programadas en el calendario).
+
+    Args:
+        workout_id: ID del entreno (viene de create_workout o get_planned_workouts)
+    """
+    client = get_client()
+    client.delete_workout(workout_id)
+    return {"borrado": True, "workout_id": workout_id}
 
 
 def _pace(speed_m_s: Optional[float]) -> Optional[str]:
